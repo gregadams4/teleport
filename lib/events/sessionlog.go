@@ -17,8 +17,10 @@ limitations under the License.
 package events
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -103,8 +105,8 @@ type DiskSessionLogger struct {
 	sid session.ID
 
 	indexFile  *os.File
-	eventsFile *os.File
-	chunksFile *os.File
+	eventsFile io.WriteCloser
+	chunksFile io.WriteCloser
 
 	lastEventIndex int64
 	lastChunkIndex int64
@@ -155,12 +157,12 @@ func (sl *DiskSessionLogger) finalize() error {
 
 // eventsFileName consists of session id and the first global event index recorded there
 func eventsFileName(dataDir string, sessionID session.ID, eventIndex int64) string {
-	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.events", sessionID.String(), eventIndex))
+	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.events.gz", sessionID.String(), eventIndex))
 }
 
 // chunksFileName consists of session id and the first global offset recorded
 func chunksFileName(dataDir string, sessionID session.ID, offset int64) string {
-	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.chunks", sessionID.String(), offset))
+	return filepath.Join(dataDir, fmt.Sprintf("%v-%v.chunks.gz", sessionID.String(), offset))
 }
 
 func (sl *DiskSessionLogger) openEventsFile(eventIndex int64) error {
@@ -172,7 +174,7 @@ func (sl *DiskSessionLogger) openEventsFile(eventIndex int64) error {
 	}
 	eventsFileName := eventsFileName(sl.DataDir, sl.SessionID, eventIndex)
 
-	// udpate the index file to write down that new events file has been created
+	// update the index file to write down that new events file has been created
 	data, err := json.Marshal(indexEntry{
 		FileName: filepath.Base(eventsFileName),
 		Type:     fileTypeEvents,
@@ -188,10 +190,11 @@ func (sl *DiskSessionLogger) openEventsFile(eventIndex int64) error {
 	}
 
 	// open new events file for writing
-	sl.eventsFile, err = os.OpenFile(eventsFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	file, err := os.OpenFile(eventsFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	sl.eventsFile = newGzipWriter(file)
 	return nil
 }
 
@@ -220,10 +223,11 @@ func (sl *DiskSessionLogger) openChunksFile(offset int64) error {
 	}
 
 	// open new chunks file for writing
-	sl.chunksFile, err = os.OpenFile(chunksFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	file, err := os.OpenFile(chunksFileName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	sl.chunksFile = newGzipWriter(file)
 	return nil
 }
 
@@ -338,4 +342,51 @@ type printEvent struct {
 	EventIndex int64 `json:"ei"`
 	// ChunkIndex is the global chunk index
 	ChunkIndex int64 `json:"ci"`
+}
+
+// gzipWriter wraps file, on close close both gzip writer and file
+type gzipWriter struct {
+	*gzip.Writer
+	file io.Closer
+}
+
+// Close closes file and gzip writer
+func (f *gzipWriter) Close() error {
+	var errors []error
+	errors = append(errors, f.Writer.Flush())
+	errors = append(errors, f.Writer.Close())
+	errors = append(errors, f.file.Close())
+	return trace.NewAggregate(errors...)
+}
+
+func newGzipWriter(file *os.File) *gzipWriter {
+	return &gzipWriter{
+		Writer: gzip.NewWriter(file),
+		file:   file,
+	}
+}
+
+// gzipReader wraps file, on close close both gzip writer and file
+type gzipReader struct {
+	io.ReadCloser
+	file io.Closer
+}
+
+// Close closes file and gzip writer
+func (f *gzipReader) Close() error {
+	var errors []error
+	errors = append(errors, f.ReadCloser.Close())
+	errors = append(errors, f.file.Close())
+	return trace.NewAggregate(errors...)
+}
+
+func newGzipReader(file *os.File) (*gzipReader, error) {
+	reader, err := gzip.NewReader(file)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &gzipReader{
+		ReadCloser: reader,
+		file:       file,
+	}, nil
 }

@@ -19,6 +19,7 @@ package events
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -52,13 +53,6 @@ const (
 
 	// LogfileExt defines the ending of the daily event log file
 	LogfileExt = ".log"
-
-	// SessionLogPrefix defines the endof of session log files
-	SessionLogPrefix = ".session.log"
-
-	// SessionStreamPrefix defines the ending of session stream files,
-	// that's where interactive PTY I/O is saved.
-	SessionStreamPrefix = ".session.bytes"
 )
 
 var (
@@ -81,6 +75,9 @@ type AuditLog struct {
 	sync.Mutex
 	*log.Entry
 	AuditLogConfig
+
+	// playbackDir is a directory used for unpacked session recordings
+	playbackDir string
 
 	loggers *ttlmap.TTLMap
 
@@ -125,6 +122,10 @@ type AuditLogConfig struct {
 	// DirMask if provided will be used to set directory mask access
 	// otherwise set to default value
 	DirMask *os.FileMode
+
+	// PlaybackRecycleTTL is a time after uncompressed playback files will be
+	// deleted
+	PlaybackRecycleTTL time.Duration
 }
 
 // CheckAndSetDefaults checks and sets defaults
@@ -151,6 +152,9 @@ func (a *AuditLogConfig) CheckAndSetDefaults() error {
 	if (a.GID != nil && a.UID == nil) || (a.UID != nil && a.GID == nil) {
 		return trace.BadParameter("if UID or GID is set, both should be specified")
 	}
+	if a.PlaybackRecycleTTL == 0 {
+		a.PlaybackRecycleTTL = time.Minute
+	}
 	return nil
 }
 
@@ -161,8 +165,8 @@ func NewAuditLog(cfg AuditLogConfig) (*AuditLog, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
-
 	al := &AuditLog{
+		playbackDir:    filepath.Join(cfg.DataDir, "playbacks"),
 		AuditLogConfig: cfg,
 		Entry: log.WithFields(log.Fields{
 			trace.Component: teleport.ComponentAuditLog,
@@ -189,6 +193,10 @@ func NewAuditLog(cfg AuditLogConfig) (*AuditLog, error) {
 	if err := os.MkdirAll(sessionDir, *cfg.DirMask); err != nil {
 		return nil, trace.ConvertSystemError(err)
 	}
+	// create a directory for uncompressed playbacks
+	if err := os.MkdirAll(al.playbackDir, *cfg.DirMask); err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
 	if cfg.UID != nil && cfg.GID != nil {
 		err := os.Chown(cfg.DataDir, *cfg.UID, *cfg.GID)
 		if err != nil {
@@ -198,9 +206,13 @@ func NewAuditLog(cfg AuditLogConfig) (*AuditLog, error) {
 		if err != nil {
 			return nil, trace.ConvertSystemError(err)
 		}
+		err = os.Chown(al.playbackDir, *cfg.UID, *cfg.GID)
+		if err != nil {
+			return nil, trace.ConvertSystemError(err)
+		}
 	}
-
 	go al.periodicCloseInactiveLoggers()
+	go al.periodicCleanupPlaybacks()
 	return al, nil
 }
 
@@ -389,6 +401,80 @@ func (l *AuditLog) GetSessionChunk(namespace string, sid session.ID, offsetBytes
 	}
 }
 
+func (l *AuditLog) cleanupOldPlaybacks() error {
+	// scan the log directory and clean files last
+	// accessed after an hour
+	df, err := os.Open(l.playbackDir)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	defer df.Close()
+	entries, err := df.Readdir(-1)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	for i := range entries {
+		fi := entries[i]
+		if fi.IsDir() {
+			continue
+		}
+		fd := fi.ModTime().UTC()
+		if l.Clock.Now().UTC().Sub(fd) <= l.PlaybackRecycleTTL {
+			continue
+		}
+		fileToRemove := filepath.Join(l.playbackDir, fi.Name())
+		err := os.Remove(fileToRemove)
+		if err != nil {
+			l.Warningf("Failed to remove file %v: %v.", fileToRemove, err)
+		}
+	}
+	return nil
+}
+
+type readSeekCloser interface {
+	io.Reader
+	io.Seeker
+	io.Closer
+}
+
+func (l *AuditLog) unpackFile(fileName string) (readSeekCloser, error) {
+	unpackedFile := filepath.Join(l.playbackDir, filepath.Base(fileName))
+	f, err := os.OpenFile(unpackedFile, os.O_RDONLY, 0640)
+	if err == nil {
+		l.Debugf("Returning %v is already unpacked at %v", fileName, unpackedFile)
+		return f, nil
+	}
+	err = trace.ConvertSystemError(err)
+	if !trace.IsNotFound(err) {
+		return nil, trace.Wrap(err)
+	}
+	start := l.Clock.Now()
+	source, err := os.OpenFile(fileName, os.O_RDONLY, 0640)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	defer source.Close()
+	reader, err := gzip.NewReader(source)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer reader.Close()
+	dest, err := os.OpenFile(unpackedFile, os.O_CREATE|os.O_RDWR, 0640)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if _, err := io.Copy(dest, reader); err != nil {
+		dest.Close()
+		return nil, trace.Wrap(err)
+	}
+	if _, err := dest.Seek(0, 0); err != nil {
+		dest.Close()
+		return nil, trace.Wrap(err)
+	}
+	l.Debugf("Uncompressed %v into %v in %v", fileName, unpackedFile, l.Clock.Now().Sub(start))
+	return dest, nil
+}
+
 func (l *AuditLog) getSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error) {
 	if namespace == "" {
 		return nil, trace.BadParameter("missing parameter namespace")
@@ -401,19 +487,18 @@ func (l *AuditLog) getSessionChunk(namespace string, sid session.ID, offsetBytes
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	fstream, err := os.OpenFile(fileName, os.O_RDONLY, 0640)
+	reader, err := l.unpackFile(fileName)
 	if err != nil {
-		log.Warning(err)
 		return nil, trace.Wrap(err)
 	}
-	defer fstream.Close()
+	defer reader.Close()
 
 	// seek to 'offset' from the beginning
-	fstream.Seek(int64(offsetBytes)-fileOffset, 0)
+	reader.Seek(int64(offsetBytes)-fileOffset, 0)
 
 	// copy up to maxBytes from the offset position:
 	var buff bytes.Buffer
-	io.Copy(&buff, io.LimitReader(fstream, int64(maxBytes)))
+	io.Copy(&buff, io.LimitReader(reader, int64(maxBytes)))
 	return buff.Bytes(), nil
 }
 
@@ -461,11 +546,16 @@ func (l *AuditLog) fetchSessionEvents(fileName string, afterN int) ([]EventField
 		return nil, trace.Wrap(err)
 	}
 	defer logFile.Close()
+	reader, err := gzip.NewReader(logFile)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer reader.Close()
 
 	retval := make([]EventFields, 0, 256)
 
 	// read line by line:
-	scanner := bufio.NewScanner(logFile)
+	scanner := bufio.NewScanner(reader)
 	for lineNo := 0; scanner.Scan(); lineNo++ {
 		if lineNo < afterN {
 			continue
@@ -868,9 +958,14 @@ func (l *AuditLog) rotateLog() (err error) {
 func (l *AuditLog) Close() error {
 	l.Lock()
 	defer l.Unlock()
+
 	if l.file != nil {
 		l.file.Close()
 		l.file = nil
+	}
+
+	if err := os.RemoveAll(l.playbackDir); err != nil {
+		log.Warningf("failed to remove temp dir: %v", err)
 	}
 
 	// close any open sessions that haven't expired yet and are open
@@ -974,6 +1069,20 @@ func (l *AuditLog) periodicCloseInactiveLoggers() {
 		select {
 		case <-ticker.C:
 			l.closeInactiveLoggers()
+		}
+	}
+}
+
+func (l *AuditLog) periodicCleanupPlaybacks() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := l.cleanupOldPlaybacks(); err != nil {
+				l.Warningf("Error while cleaning up playback files: %v.", err)
+			}
 		}
 	}
 }
