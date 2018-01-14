@@ -17,7 +17,6 @@ limitations under the License.
 package events
 
 import (
-	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -367,32 +366,9 @@ type printEvent struct {
 }
 
 // gzipWriter wraps file, on close close both gzip writer and file
-type gzipWriterOrig struct {
+type gzipWriter struct {
 	*gzip.Writer
 	file *os.File
-}
-
-// Close closes gzip writer and file
-func (f *gzipWriterOrig) Close() error {
-	var errors []error
-	errors = append(errors, f.Writer.Close())
-	errors = append(errors, f.file.Close())
-	return trace.NewAggregate(errors...)
-}
-
-func newGzipWriterOrig(file *os.File) *gzipWriterOrig {
-	w := gzip.NewWriter(file)
-	return &gzipWriterOrig{
-		Writer: w,
-		file:   file,
-	}
-}
-
-// gzipWriter wraps file, on close close both gzip writer and file
-type gzipWriter struct {
-	gzip *gzip.Writer
-	file *os.File
-	buf  *bufio.Writer
 }
 
 // Close closes gzip writer and file
@@ -404,11 +380,10 @@ func (f *gzipWriter) Close() error {
 }
 
 func newGzipWriter(file *os.File) *gzipWriter {
-	w := newGzipWriter(file)
+	w := gzip.NewWriter(file)
 	return &gzipWriter{
-		buf:  bufio.NewWriter(),
-		gzip: w,
-		file: file,
+		Writer: w,
+		file:   file,
 	}
 }
 

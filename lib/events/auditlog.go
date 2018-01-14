@@ -173,7 +173,7 @@ func NewAuditLog(cfg AuditLogConfig) (*AuditLog, error) {
 		}),
 	}
 	loggers, err := ttlmap.New(defaults.AuditLogSessions,
-		ttlmap.CallOnExpire(al.asyncCloseSessionLogger), ttlmap.Clock(cfg.Clock))
+		ttlmap.CallOnExpire(al.closeSessionLogger), ttlmap.Clock(cfg.Clock))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1076,10 +1076,6 @@ func (l *AuditLog) LoggerFor(namespace string, sid session.ID, compatibilityMode
 		return sessionLogger, nil
 	}
 
-}
-
-func (l *AuditLog) asyncCloseSessionLogger(key string, val interface{}) {
-	go l.closeSessionLogger(key, val)
 }
 
 func (l *AuditLog) closeSessionLogger(key string, val interface{}) {
