@@ -17,6 +17,7 @@ limitations under the License.
 package events
 
 import (
+	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -33,7 +34,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// SessionLogger is an interface that all session loggers must implement.
+// sessionLogger is an interface that all session loggers must implement.
 type SessionLogger interface {
 	// LogEvent logs events associated with this session.
 	LogEvent(fields EventFields) error
@@ -47,10 +48,8 @@ type SessionLogger interface {
 	// releasing audit resources associated with the session
 	Finalize() error
 
-	// WriteChunk takes a stream of bytes (usually the output from a session
-	// terminal) and writes it into a "stream file", for future replay of
-	// interactive sessions.
-	WriteChunk(chunk *SessionChunk) (written int, err error)
+	// PostSessionSlice posts session slice
+	PostSessionSlice(slice SessionSlice) error
 }
 
 // DiskSessionLoggerConfig sets up parameters for disk session logger
@@ -105,26 +104,22 @@ type DiskSessionLogger struct {
 	sid session.ID
 
 	indexFile  *os.File
-	eventsFile io.WriteCloser
-	chunksFile io.WriteCloser
+	eventsFile *gzipWriter
+	chunksFile *gzipWriter
 
 	lastEventIndex int64
 	lastChunkIndex int64
-
-	// recordSessions controls if sessions are recorded along with audit events.
-	recordSessions bool
 }
 
 // LogEvent logs an event associated with this session
 func (sl *DiskSessionLogger) LogEvent(fields EventFields) error {
-	panic("does  not work")
+	panic("should not be used")
 }
 
 // Close is called when clients close on the requested "session writer".
 // We ignore their requests because this writer (file) should be closed only
 // when the session logger is closed
 func (sl *DiskSessionLogger) Close() error {
-	sl.Debugf("Close")
 	return nil
 }
 
@@ -137,7 +132,22 @@ func (sl *DiskSessionLogger) Finalize() error {
 	return sl.finalize()
 }
 
+// flush is used to flush gzip frames to file, otherwise
+// some attempts to read the file could fail
+func (sl *DiskSessionLogger) flush() error {
+	var err, err2 error
+
+	if sl.RecordSessions && sl.chunksFile != nil {
+		err = sl.chunksFile.Flush()
+	}
+	if sl.eventsFile != nil {
+		err2 = sl.eventsFile.Flush()
+	}
+	return trace.NewAggregate(err, err2)
+}
+
 func (sl *DiskSessionLogger) finalize() error {
+
 	auditOpenFiles.Dec()
 
 	if sl.indexFile != nil {
@@ -231,11 +241,23 @@ func (sl *DiskSessionLogger) openChunksFile(offset int64) error {
 	return nil
 }
 
-// WriteChunk takes a stream of bytes (usually the output from a session terminal)
-// and writes it into a "stream file", for future replay of interactive sessions.
-func (sl *DiskSessionLogger) WriteChunk(chunk *SessionChunk) (written int, err error) {
+// PostSessionSlice takes series of events associated with the session
+// and writes them to events files and data file for future replays
+func (sl *DiskSessionLogger) PostSessionSlice(slice SessionSlice) error {
 	sl.Lock()
 	defer sl.Unlock()
+
+	for i := range slice.Chunks {
+		_, err := sl.writeChunk(slice.Chunks[i])
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
+	return sl.flush()
+}
+
+func (sl *DiskSessionLogger) writeChunk(chunk *SessionChunk) (written int, err error) {
 
 	// this section enforces the following invariant:
 	// a single events file only contains successive events
@@ -345,24 +367,48 @@ type printEvent struct {
 }
 
 // gzipWriter wraps file, on close close both gzip writer and file
-type gzipWriter struct {
+type gzipWriterOrig struct {
 	*gzip.Writer
-	file io.Closer
+	file *os.File
 }
 
-// Close closes file and gzip writer
+// Close closes gzip writer and file
+func (f *gzipWriterOrig) Close() error {
+	var errors []error
+	errors = append(errors, f.Writer.Close())
+	errors = append(errors, f.file.Close())
+	return trace.NewAggregate(errors...)
+}
+
+func newGzipWriterOrig(file *os.File) *gzipWriterOrig {
+	w := gzip.NewWriter(file)
+	return &gzipWriterOrig{
+		Writer: w,
+		file:   file,
+	}
+}
+
+// gzipWriter wraps file, on close close both gzip writer and file
+type gzipWriter struct {
+	gzip *gzip.Writer
+	file *os.File
+	buf  *bufio.Writer
+}
+
+// Close closes gzip writer and file
 func (f *gzipWriter) Close() error {
 	var errors []error
-	errors = append(errors, f.Writer.Flush())
 	errors = append(errors, f.Writer.Close())
 	errors = append(errors, f.file.Close())
 	return trace.NewAggregate(errors...)
 }
 
 func newGzipWriter(file *os.File) *gzipWriter {
+	w := newGzipWriter(file)
 	return &gzipWriter{
-		Writer: gzip.NewWriter(file),
-		file:   file,
+		buf:  bufio.NewWriter(),
+		gzip: w,
+		file: file,
 	}
 }
 

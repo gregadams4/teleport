@@ -233,13 +233,7 @@ func (l *AuditLog) PostSessionSlice(slice SessionSlice) error {
 		l.Errorf("failed to get logger: %v", trace.DebugReport(err))
 		return trace.BadParameter("audit.log: no session writer for %s", slice.SessionID)
 	}
-	for i := range slice.Chunks {
-		_, err := sl.WriteChunk(slice.Chunks[i])
-		if err != nil {
-			return trace.Wrap(err)
-		}
-	}
-	return nil
+	return sl.PostSessionSlice(slice)
 }
 
 // DELETE IN: 2.6.0
@@ -441,7 +435,6 @@ func (l *AuditLog) unpackFile(fileName string) (readSeekCloser, error) {
 	unpackedFile := filepath.Join(l.playbackDir, filepath.Base(fileName))
 	f, err := os.OpenFile(unpackedFile, os.O_RDONLY, 0640)
 	if err == nil {
-		l.Debugf("Returning %v is already unpacked at %v", fileName, unpackedFile)
 		return f, nil
 	}
 	err = trace.ConvertSystemError(err)
@@ -449,6 +442,10 @@ func (l *AuditLog) unpackFile(fileName string) (readSeekCloser, error) {
 		return nil, trace.Wrap(err)
 	}
 	start := l.Clock.Now()
+	dest, err := os.OpenFile(unpackedFile, os.O_CREATE|os.O_RDWR, 0640)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
 	source, err := os.OpenFile(fileName, os.O_RDONLY, 0640)
 	if err != nil {
 		return nil, trace.ConvertSystemError(err)
@@ -459,13 +456,14 @@ func (l *AuditLog) unpackFile(fileName string) (readSeekCloser, error) {
 		return nil, trace.Wrap(err)
 	}
 	defer reader.Close()
-	dest, err := os.OpenFile(unpackedFile, os.O_CREATE|os.O_RDWR, 0640)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
 	if _, err := io.Copy(dest, reader); err != nil {
-		dest.Close()
-		return nil, trace.Wrap(err)
+		// Unexpected EOF is returned by gzip reader
+		// when the file has not been closed yet,
+		// ignore this error
+		if err != io.ErrUnexpectedEOF {
+			dest.Close()
+			return nil, trace.Wrap(err)
+		}
 	}
 	if _, err := dest.Seek(0, 0); err != nil {
 		dest.Close()
@@ -528,6 +526,8 @@ func (l *AuditLog) GetSessionEvents(namespace string, sid session.ID, afterN int
 			skip = afterN
 		}
 		out, err := l.fetchSessionEvents(idx.eventsFileName(i), skip)
+		l.Debugf("here we go again: %v, %v, %v", idx.eventsFileName(i), out, err)
+		printFile(idx.eventsFileName(i))
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -553,7 +553,6 @@ func (l *AuditLog) fetchSessionEvents(fileName string, afterN int) ([]EventField
 	defer reader.Close()
 
 	retval := make([]EventFields, 0, 256)
-
 	// read line by line:
 	scanner := bufio.NewScanner(reader)
 	for lineNo := 0; scanner.Scan(); lineNo++ {
@@ -723,16 +722,16 @@ func (l *AuditLog) migrateSessionsDir() error {
 		}
 		sessionID := parts[0]
 		sourceEventsFile := filepath.Join(recordingsDir, fmt.Sprintf("%v.session.log", sessionID))
-		targetEventsFile := filepath.Join(recordingsDir, fmt.Sprintf("%v-0.events", sessionID))
+		targetEventsFile := filepath.Join(recordingsDir, fmt.Sprintf("%v-0.events.gz", sessionID))
 		l.Debugf("Migrating, session ID %v. Renamed %v to %v", sessionID, sourceEventsFile, targetEventsFile)
-		err := os.Rename(sourceEventsFile, targetEventsFile)
+		err := moveAndGzipFile(sourceEventsFile, targetEventsFile)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 		sourceChunksFile := filepath.Join(recordingsDir, fmt.Sprintf("%v.session.bytes", sessionID))
-		targetChunksFile := filepath.Join(recordingsDir, fmt.Sprintf("%v-0.chunks", sessionID))
+		targetChunksFile := filepath.Join(recordingsDir, fmt.Sprintf("%v-0.chunks.gz", sessionID))
 		l.Debugf("Migrating session ID %v. Renamed %v to %v", sessionID, sourceChunksFile, targetChunksFile)
-		err = os.Rename(sourceChunksFile, targetChunksFile)
+		err = moveAndGzipFile(sourceChunksFile, targetChunksFile)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -774,6 +773,44 @@ func (l *AuditLog) migrateSessionsDir() error {
 		return trace.ConvertSystemError(err)
 	}
 	return nil
+}
+
+func moveAndGzipFile(source string, target string) error {
+	sourceFile, err := os.Open(source)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	defer sourceFile.Close()
+	destFile, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	destWriter := newGzipWriter(destFile)
+	defer destWriter.Close()
+	_, err = io.Copy(destWriter, sourceFile)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if err := os.Remove(source); err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func printFile(source string) {
+	sourceFile, err := os.Open(source)
+	if err != nil {
+		return
+	}
+	defer sourceFile.Close()
+	destReader, err := newGzipReader(sourceFile)
+	if err != nil {
+		return
+	}
+	defer destReader.Close()
+	buf := &bytes.Buffer{}
+	_, err = io.Copy(buf, destReader)
+	log.Warningf("printFile: %v %q", err, buf.String())
 }
 
 func listDir(dir string) ([]os.FileInfo, error) {
@@ -962,10 +999,6 @@ func (l *AuditLog) Close() error {
 	if l.file != nil {
 		l.file.Close()
 		l.file = nil
-	}
-
-	if err := os.RemoveAll(l.playbackDir); err != nil {
-		log.Warningf("failed to remove temp dir: %v", err)
 	}
 
 	// close any open sessions that haven't expired yet and are open
