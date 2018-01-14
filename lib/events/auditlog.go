@@ -526,8 +526,6 @@ func (l *AuditLog) GetSessionEvents(namespace string, sid session.ID, afterN int
 			skip = afterN
 		}
 		out, err := l.fetchSessionEvents(idx.eventsFileName(i), skip)
-		l.Debugf("here we go again: %v, %v, %v", idx.eventsFileName(i), out, err)
-		printFile(idx.eventsFileName(i))
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -795,22 +793,6 @@ func moveAndGzipFile(source string, target string) error {
 		return trace.Wrap(err)
 	}
 	return nil
-}
-
-func printFile(source string) {
-	sourceFile, err := os.Open(source)
-	if err != nil {
-		return
-	}
-	defer sourceFile.Close()
-	destReader, err := newGzipReader(sourceFile)
-	if err != nil {
-		return
-	}
-	defer destReader.Close()
-	buf := &bytes.Buffer{}
-	_, err = io.Copy(buf, destReader)
-	log.Warningf("printFile: %v %q", err, buf.String())
 }
 
 func listDir(dir string) ([]os.FileInfo, error) {
